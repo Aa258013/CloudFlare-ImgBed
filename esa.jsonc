@@ -1,8 +1,4 @@
 {
-  "name": "CloudFlare-ImgBed",
-  "entry": "./index.js",
-  "assets": {
-    "directory": "./",
-    "notFoundStrategy": "singlePageApplication"
-  }
+  "name": "cloudflare-imgbed",
+  "entry": "./index.js"
 }
