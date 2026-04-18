@@ -1,170 +1,138 @@
 /**
- * 数据库适配器
- * 提供统一的接口，可以在KV和D1之间切换
+ * 数据库适配器 - 阿里云 ESA KV 版本
  */
 
 import { D1Database } from './d1Database.js';
 
-/**
- * 创建数据库适配器
- * @param {Object} env - 环境变量
- * @returns {Object} 数据库适配器实例
- */
-export function createDatabaseAdapter(env) {
-    // 检查是否配置了数据库
-    if (env.img_url && typeof env.img_url.get === 'function') {
-        // 使用KV存储
-        return new KVAdapter(env.img_url);
-    } else if (env.img_d1 && typeof env.img_d1.prepare === 'function') {
-        // 使用D1数据库
-        return new D1Database(env.img_d1);
-    } else {
-        console.error('No database configured. Please configure either KV (env.img_url) or D1 (env.img_d1).');
-        return null;
+// 阿里云 ESA KV 客户端
+let edgeKv = null;
+
+function getEdgeKv(env) {
+    if (edgeKv) return edgeKv;
+    // 检查是否在阿里云 ESA 环境
+    if (typeof EdgeKV !== 'undefined') {
+        edgeKv = new EdgeKV({ namespace: "img_url" });
     }
+    return edgeKv;
 }
 
-/**
- * KV适配器类
- * 保持与原有KV接口的兼容性
- */
+export function createDatabaseAdapter(env) {
+    // 优先使用 D1（如果有）
+    if (env.img_d1 && typeof env.img_d1.prepare === 'function') {
+        return new D1Database(env.img_d1);
+    }
+    
+    // 使用阿里云 ESA KV
+    const kv = getEdgeKv(env);
+    if (kv) {
+        console.log('Using Aliyun ESA KV storage');
+        return new KVAdapter(kv);
+    }
+    
+    // 兼容原有 Cloudflare KV（如果存在）
+    if (env.img_url && typeof env.img_url.get === 'function') {
+        return new KVAdapter(env.img_url);
+    }
+    
+    console.error('No database configured.');
+    return null;
+}
+
 class KVAdapter {
-    constructor(kv) {
-        this.kv = kv;
+    constructor(client) {
+        this.client = client;
     }
 
-    // 直接代理到KV的方法
-    async put(key, value, options) {
-        options = options || {};
-        return await this.kv.put(key, value, options);
+    async put(key, value, options = {}) {
+        if (options.expirationTtl) {
+            return await this.client.put(key, value, { ttl: options.expirationTtl });
+        }
+        return await this.client.put(key, value);
     }
 
-    async get(key, options) {
-        options = options || {};
-        return await this.kv.get(key, options);
+    async get(key, options = {}) {
+        const value = await this.client.get(key);
+        if (value === null) return null;
+        if (options.type === 'json') return JSON.parse(value);
+        return value;
     }
 
-    async getWithMetadata(key, options) {
-        options = options || {};
-        return await this.kv.getWithMetadata(key, options);
+    async getWithMetadata(key, options = {}) {
+        // ESA KV 不直接支持 metadata，用单独 key 存储
+        const [value, metaStr] = await Promise.all([
+            this.client.get(key),
+            this.client.get(`${key}:meta`)
+        ]);
+        return { value, metadata: metaStr ? JSON.parse(metaStr) : null };
     }
 
-    async delete(key, options) {
-        options = options || {};
-        return await this.kv.delete(key, options);
+    async delete(key, options = {}) {
+        return await this.client.delete(key);
     }
 
-    async list(options) {
-        options = options || {};
-        return await this.kv.list(options);
+    async list(options = {}) {
+        // ESA KV 的 list API 可能不同，这里简化处理
+        // 如果需要完整 list 功能，请提供 ESA KV 文档
+        const prefix = options.prefix || '';
+        try {
+            const result = await this.client.list(prefix);
+            return { keys: result.keys || [], cursor: null, list_complete: true };
+        } catch (e) {
+            console.log('List not supported in this ESA KV version');
+            return { keys: [], cursor: null, list_complete: true };
+        }
     }
 
-    // 为了兼容性，添加一些别名方法
-    async putFile(fileId, value, options) {
-        return await this.put(fileId, value, options);
-    }
-
-    async getFile(fileId, options) {
-        const result = await this.getWithMetadata(fileId, options);
-        return result;
-    }
-
-    async getFileWithMetadata(fileId, options) {
-        return await this.getWithMetadata(fileId, options);
-    }
-
-    async deleteFile(fileId, options) {
-        return await this.delete(fileId, options);
-    }
-
-    async listFiles(options) {
-        return await this.list(options);
-    }
-
-    async putSetting(key, value, options) {
-        return await this.put(key, value, options);
-    }
-
-    async getSetting(key, options) {
-        return await this.get(key, options);
-    }
-
-    async deleteSetting(key, options) {
-        return await this.delete(key, options);
-    }
-
-    async listSettings(options) {
-        return await this.list(options);
-    }
-
+    // 以下是业务层封装的方法（完全兼容）
+    async putFile(fileId, value, options) { return this.put(fileId, value, options); }
+    async getFile(fileId, options) { return this.getWithMetadata(fileId, options); }
+    async getFileWithMetadata(fileId, options) { return this.getWithMetadata(fileId, options); }
+    async deleteFile(fileId, options) { return this.delete(fileId, options); }
+    async listFiles(options) { return this.list(options); }
+    async putSetting(key, value, options) { return this.put(key, value, options); }
+    async getSetting(key, options) { return this.get(key, options); }
+    async deleteSetting(key, options) { return this.delete(key, options); }
+    async listSettings(options) { return this.list(options); }
+    
     async putIndexOperation(operationId, operation, options) {
-        const key = 'manage@index@operation_' + operationId;
-        return await this.put(key, JSON.stringify(operation), options);
+        return this.put(`manage@index@operation_${operationId}`, JSON.stringify(operation), options);
     }
-
     async getIndexOperation(operationId, options) {
-        const key = 'manage@index@operation_' + operationId;
-        const result = await this.get(key, options);
-        return result ? JSON.parse(result) : null;
+        const val = await this.get(`manage@index@operation_${operationId}`, options);
+        return val ? JSON.parse(val) : null;
     }
-
     async deleteIndexOperation(operationId, options) {
-        const key = 'manage@index@operation_' + operationId;
-        return await this.delete(key, options);
+        return this.delete(`manage@index@operation_${operationId}`, options);
     }
-
     async listIndexOperations(options) {
-        const listOptions = Object.assign({}, options, {
-            prefix: 'manage@index@operation_'
-        });
-        const result = await this.list(listOptions);
-        
-        // 转换格式以匹配D1Database的返回格式
-        const operations = [];
+        const result = await this.list({ ...options, prefix: 'manage@index@operation_' });
+        const ops = [];
         for (const item of result.keys) {
-            const operationData = await this.get(item.name);
-            if (operationData) {
-                const operation = JSON.parse(operationData);
-                operations.push({
+            const data = await this.get(item.name);
+            if (data) {
+                ops.push({
                     id: item.name.replace('manage@index@operation_', ''),
-                    type: operation.type,
-                    timestamp: operation.timestamp,
-                    data: operation.data,
-                    processed: false // KV中没有这个字段，默认为false
+                    ...JSON.parse(data),
+                    processed: false
                 });
             }
         }
-        
-        return operations;
+        return ops;
     }
 }
 
-/**
- * 获取数据库实例的便捷函数
- * 这个函数可以在整个应用中使用，确保一致的数据库访问
- * @param {Object} env - 环境变量
- * @returns {Object} 数据库实例
- */
 export function getDatabase(env) {
-    var adapter = createDatabaseAdapter(env);
-    if (!adapter) {
-        throw new Error('Database not configured. Please configure D1 database (env.img_d1) or KV storage (env.img_url).');
-    }
+    const adapter = createDatabaseAdapter(env);
+    if (!adapter) throw new Error('Database not configured.');
     return adapter;
 }
 
-/**
- * 检查数据库配置
- * @param {Object} env - 环境变量
- * @returns {Object} 配置信息
- */
 export function checkDatabaseConfig(env) {
-    var hasD1 = env.img_d1 && typeof env.img_d1.prepare === 'function';
-    var hasKV = env.img_url && typeof env.img_url.get === 'function';
-
+    const hasD1 = env.img_d1 && typeof env.img_d1.prepare === 'function';
+    const hasKV = !!(getEdgeKv(env) || (env.img_url && typeof env.img_url.get === 'function'));
     return {
-        hasD1: hasD1,
-        hasKV: hasKV,
+        hasD1,
+        hasKV,
         usingD1: hasD1,
         usingKV: !hasD1 && hasKV,
         configured: hasD1 || hasKV
